@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automates BMS CSV timeseries extraction, COV forward-filling, matching/CLI reporting, and backfill CLI execution."""
+"""Automates BMS CSV timeseries extraction (via Mapping Key), COV forward-filling, reporting, and backfill CLI execution."""
 
 from collections import defaultdict
 import csv
@@ -33,107 +33,34 @@ VALID_TIMESTAMP_REGEX = re.compile(
     r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$"
 )
 
-# Common BACnet / WebCTRL / Trane trend suffixes stripped before matching in Loadsheet mode.
-# Note: '_alarm' is intentionally NOT stripped so alarm points remain distinct.
-POINT_SUFFIX_REGEX = re.compile(
-    r"_(?:bavo|bavi|bbvo|bbvi|bav|bbv|bai|bao|bbi|bbo|ai|ao|av|bi|bo|bv|tn)$",
-    re.IGNORECASE,
-)
-
 STEPS_DESCRIPTION = """
 Workflow Steps:
-  1. Read mapping input (.xlsx: Loadsheet OR BMS CSV standardFieldName mapping key)
+  1. Read BMS CSV standardFieldName mapping key (.xlsx)
   2. Read proxy_id <-> device_num_id mappings (.csv)
   3. Match BMS timeseries data (.csv) [heavy step]
   4. Generate per-proxyId CSVs (with COV forward-fill) and CLI command files
-  5. Write Loadsheet Matching & broken timestamps report tabs (backfill_report.xlsx)
+  5. Write Mapping Key Matching & broken timestamps report tabs (backfill_report.xlsx)
   6. Run backfill CLI commands (p4 g4d / g4 sync / blaze run) & record results
 """
 
-MODE_LOADSHEET = 1
-MODE_MAPPING_KEY = 2
 
-
-class LoadsheetRow:
-  """Represents a single relevant mapping row from either a Loadsheet or a Mapping Key .xlsx."""
+class MappingRow:
+  """Represents a single mapping row from the BMS CSV standardFieldName mapping key."""
 
   def __init__(
       self,
       row_number: int,
-      control_program: str,
-      object_name: str,
-      raw_path: str,
-      path_prefix: str,
-      raw_point_segment: str,
-      normalized_point: str,
+      unique_col2_value: str,
       proxy_id: str,
       building: str,
       standard_field_name: str,
-      exact_col2_match: Optional[str] = None,
   ) -> None:
     self.row_number = row_number
-    self.control_program = control_program
-    self.object_name = object_name
-    self.raw_path = raw_path
-    self.path_prefix = path_prefix
-    self.raw_point_segment = raw_point_segment
-    self.normalized_point = normalized_point
+    self.unique_col2_value = unique_col2_value
     self.proxy_id = proxy_id
     self.building = building
     self.standard_field_name = standard_field_name
-    self.exact_col2_match = exact_col2_match
     self.matched_bms_rows: int = 0
-    self.matched_bms_col2_samples: set = set()
-
-
-def normalize_point_name(point_segment: str) -> str:
-  """Strips known BACnet/trend suffixes (e.g. _bavo, _bavi, _bbvo, _ai, _tn) while preserving _alarm."""
-  return POINT_SUFFIX_REGEX.sub("", point_segment.strip())
-
-
-def extract_building(building_val: str, full_asset_path: str) -> str:
-  """Extracts building from 'building' column, or left of first ':' in 'fullAssetPath'."""
-  if building_val:
-    return building_val.strip()
-  if full_asset_path and ":" in full_asset_path:
-    return full_asset_path.split(":", 1)[0].strip()
-  return ""
-
-
-def parse_loadsheet_path(
-    path_val: str, object_name: str
-) -> Tuple[str, str, str]:
-  """Extracts (path_prefix, raw_point_segment, normalized_point) from loadsheet path or objectName."""
-  cleaned_path = (path_val or "").strip().strip("/")
-  if cleaned_path:
-    parts = [p.strip() for p in cleaned_path.split("/") if p.strip()]
-    if parts and parts[-1].lower() == "trend_log":
-      parts = parts[:-1]
-    if len(parts) >= 2:
-      prefix = parts[0].lstrip("#").lower()
-      raw_seg = parts[-1]
-    elif len(parts) == 1:
-      prefix = ""
-      raw_seg = parts[0]
-    else:
-      prefix = ""
-      raw_seg = ""
-  else:
-    prefix = ""
-    raw_seg = re.sub(r"_\d+$", "", (object_name or "").strip())
-
-  return prefix, raw_seg, normalize_point_name(raw_seg)
-
-
-def parse_bms_col2(col2_path: str) -> Tuple[str, str]:
-  """Extracts (path_prefix, normalized_point) from Column 2 of the BMS CSV."""
-  cleaned = col2_path.strip().strip("/")
-  parts = [p.strip() for p in cleaned.split("/") if p.strip()]
-  if parts and parts[-1].lower() == "trend_log":
-    parts = parts[:-1]
-  if len(parts) < 2:
-    return (parts[0].lstrip("#").lower() if parts else ""), ""
-  return parts[0].lstrip("#").lower(), normalize_point_name(parts[-1])
 
 
 def render_progress_bar(
@@ -160,9 +87,6 @@ def convert_and_classify_seattle_tz(
 
   Returns:
     (formatted_timestamp, is_regular, error_reason)
-    - If unparseable: (None, False, error_reason)
-    - If parseable with fractional seconds (COV): ('YYYY-MM-DD HH:MM:SS.mmm±HH:MM', False, 'COV / fractional seconds (forward-filled, omitted from CSV)')
-    - If parseable whole seconds: ('YYYY-MM-DD HH:MM:SS±HH:MM', True, None)
   """
   raw = timestamp_str.strip()
   cached = cache.get(raw)
@@ -202,95 +126,9 @@ def convert_and_classify_seattle_tz(
   return result
 
 
-def read_loadsheet(xlsx_path: Path) -> List[LoadsheetRow]:
-  """Reads the standard Excel loadsheet and extracts rows with a non-blank proxyId."""
-  wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
-  ws = wb.active
-
-  rows_iter = ws.iter_rows(values_only=True)
-  try:
-    header_row = next(rows_iter)
-  except StopIteration:
-    wb.close()
-    raise ValueError(f"Loadsheet '{xlsx_path}' is empty.")
-
-  headers = [
-      str(col).strip() if col is not None else "" for col in header_row
-  ]
-  headers_lower = {name.lower(): i for i, name in enumerate(headers) if name}
-
-  required_cols = {"controlprogram", "objectname", "proxyid", "standardfieldname"}
-  missing = required_cols - set(headers_lower.keys())
-  if missing:
-    wb.close()
-    raise ValueError(
-        f"Loadsheet is missing required columns: {', '.join(sorted(missing))}"
-    )
-
-  path_idx: Optional[int] = headers_lower.get("path")
-  building_idx: Optional[int] = headers_lower.get("building")
-  full_asset_idx: Optional[int] = headers_lower.get("fullassetpath")
-
-  mappings: List[LoadsheetRow] = []
-  for row_num, row in enumerate(rows_iter, start=2):
-    if not row:
-      continue
-
-    def get_val(col_key_lower: str) -> str:
-      idx = headers_lower[col_key_lower]
-      if idx < len(row) and row[idx] is not None:
-        return str(row[idx]).strip()
-      return ""
-
-    def get_opt_val(idx: Optional[int]) -> str:
-      if idx is not None and idx < len(row) and row[idx] is not None:
-        return str(row[idx]).strip()
-      return ""
-
-    proxy_id = get_val("proxyid")
-    if not proxy_id:
-      continue
-
-    control_program = get_val("controlprogram")
-    object_name = get_val("objectname")
-    standard_field_name = get_val("standardfieldname")
-    raw_path = get_opt_val(path_idx)
-    building = extract_building(
-        get_opt_val(building_idx), get_opt_val(full_asset_idx)
-    )
-
-    if not (control_program and standard_field_name):
-      continue
-
-    path_prefix, raw_point_seg, normalized_point = parse_loadsheet_path(
-        raw_path, object_name
-    )
-    if not normalized_point:
-      continue
-
-    mappings.append(
-        LoadsheetRow(
-            row_number=row_num,
-            control_program=control_program,
-            object_name=object_name,
-            raw_path=raw_path,
-            path_prefix=path_prefix,
-            raw_point_segment=raw_point_seg,
-            normalized_point=normalized_point,
-            proxy_id=proxy_id,
-            building=building,
-            standard_field_name=standard_field_name,
-            exact_col2_match=None,
-        )
-    )
-
-  wb.close()
-  return mappings
-
-
 def read_mapping_key_xlsx(
     xlsx_path: Path, building_name: str
-) -> List[LoadsheetRow]:
+) -> List[MappingRow]:
   """Reads the BMS CSV standardFieldName mapping key (.xlsx) with columns unique_col2_value, proxyId, standardFieldName."""
   wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
   ws = wb.active
@@ -320,7 +158,7 @@ def read_mapping_key_xlsx(
   proxy_idx = headers_lower["proxyid"]
   field_idx = headers_lower["standardfieldname"]
 
-  mappings: List[LoadsheetRow] = []
+  mappings: List[MappingRow] = []
   for row_num, row in enumerate(rows_iter, start=2):
     if not row:
       continue
@@ -337,22 +175,13 @@ def read_mapping_key_xlsx(
     if not (unique_col2 and proxy_id and standard_field_name):
       continue
 
-    path_prefix, raw_point_seg, normalized_point = parse_loadsheet_path(
-        unique_col2, ""
-    )
     mappings.append(
-        LoadsheetRow(
+        MappingRow(
             row_number=row_num,
-            control_program="(Direct Col2 Mapping Key)",
-            object_name=raw_point_seg,
-            raw_path=unique_col2,
-            path_prefix=path_prefix,
-            raw_point_segment=raw_point_seg,
-            normalized_point=normalized_point or unique_col2,
+            unique_col2_value=unique_col2,
             proxy_id=proxy_id,
             building=building_name.strip(),
             standard_field_name=standard_field_name,
-            exact_col2_match=unique_col2,
         )
     )
 
@@ -396,23 +225,16 @@ def read_device_num_id_mappings(csv_path: Path) -> Dict[str, str]:
 
 
 def process_bms_csv(
-    bms_csv_path: Path, mappings: List[LoadsheetRow]
+    bms_csv_path: Path, mappings: List[MappingRow]
 ) -> Tuple[
     Dict[str, Dict[str, Dict[str, str]]],
     Dict[str, List[str]],
     Dict[Tuple[str, str, str, str], int],
 ]:
-  """Streams the headerless BMS CSV, ingesting both regular and COV timestamps for forward-filling."""
-  by_exact_col2: Dict[str, List[LoadsheetRow]] = defaultdict(list)
-  by_normalized_point: Dict[str, List[LoadsheetRow]] = defaultdict(list)
-
+  """Streams the headerless BMS CSV, matching directly on Column 2 and ingesting regular + COV timestamps."""
+  by_exact_col2: Dict[str, List[MappingRow]] = defaultdict(list)
   for item in mappings:
-    if item.exact_col2_match is not None:
-      by_exact_col2[item.exact_col2_match].append(item)
-    else:
-      by_normalized_point[item.normalized_point].append(item)
-
-  has_fuzzy_mappings = bool(by_normalized_point)
+    by_exact_col2[item.unique_col2_value].append(item)
 
   timeseries_by_proxy: Dict[str, Dict[str, Dict[str, str]]] = defaultdict(
       lambda: defaultdict(dict)
@@ -421,7 +243,6 @@ def process_bms_csv(
   matched_fields_set: Dict[str, set] = defaultdict(set)
   broken_timestamps: Dict[Tuple[str, str, str, str], int] = defaultdict(int)
 
-  col2_cache: Dict[str, Tuple[str, str]] = {}
   ts_cache: Dict[str, Tuple[Optional[str], bool, Optional[str]]] = {}
 
   total_bytes = bms_csv_path.stat().st_size
@@ -456,32 +277,7 @@ def process_bms_csv(
           )
           last_update = now
 
-      matched_rows: List[LoadsheetRow] = []
-
-      direct_matches = by_exact_col2.get(col2_path)
-      if direct_matches:
-        matched_rows.extend(direct_matches)
-
-      if has_fuzzy_mappings:
-        parsed_col2 = col2_cache.get(col2_path)
-        if parsed_col2 is None:
-          parsed_col2 = parse_bms_col2(col2_path)
-          if len(col2_cache) < 50_000:
-            col2_cache[col2_path] = parsed_col2
-
-        col2_prefix, col2_norm_point = parsed_col2
-        if col2_norm_point:
-          candidates = by_normalized_point.get(col2_norm_point)
-          if candidates:
-            col3_location = row[2].strip()
-            for candidate in candidates:
-              prefix_ok = (
-                  not (candidate.path_prefix and col2_prefix)
-                  or candidate.path_prefix == col2_prefix
-              )
-              if prefix_ok and candidate.control_program in col3_location:
-                matched_rows.append(candidate)
-
+      matched_rows = by_exact_col2.get(col2_path)
       if not matched_rows:
         continue
 
@@ -508,8 +304,6 @@ def process_bms_csv(
       matched_bms_count += 1
       for matched in matched_rows:
         matched.matched_bms_rows += 1
-        if len(matched.matched_bms_col2_samples) < 3:
-          matched.matched_bms_col2_samples.add(col2_path)
         p_id = matched.proxy_id
         field = matched.standard_field_name
         timeseries_by_proxy[p_id][local_ts][field] = col5_value
@@ -578,13 +372,11 @@ def write_proxy_outputs(
       writer.writerow(["timestamp", *matched_fields])
       for local_ts in sorted(ts_data.keys()):
         point_values = ts_data[local_ts]
-        # Update COV state for all non-empty values (including irregular/COV timestamps)
         for field in matched_fields:
           val = point_values.get(field, "")
           if val != "":
             last_seen[field] = val
 
-        # Only emit regular whole-second timestamps to the final CSV
         if not VALID_TIMESTAMP_REGEX.match(local_ts):
           continue
 
@@ -605,11 +397,11 @@ def write_proxy_outputs(
 
 def write_matching_and_cli_report(
     report_path: Path,
-    mappings: Optional[List[LoadsheetRow]],
+    mappings: Optional[List[MappingRow]],
     broken_timestamps: Optional[Dict[Tuple[str, str, str, str], int]] = None,
     cli_results: Optional[List[Dict[str, str]]] = None,
 ) -> None:
-  """Writes or updates backfill_report.xlsx with Loadsheet Matching, broken timestamps, and CLI Execution Results tabs."""
+  """Writes or updates backfill_report.xlsx with Mapping Key Matching, broken timestamps, and CLI Execution Results tabs."""
   header_font = Font(bold=True, color="FFFFFF")
   header_fill = PatternFill(
       start_color="1F4E78", end_color="1F4E78", fill_type="solid"
@@ -626,27 +418,23 @@ def write_matching_and_cli_report(
   else:
     wb = openpyxl.Workbook()
 
-  # Tab 1: Loadsheet Matching
+  # Tab 1: Mapping Key Matching
   if mappings is not None:
-    if "Loadsheet Matching" in wb.sheetnames:
-      ws_match = wb["Loadsheet Matching"]
+    if "Mapping Key Matching" in wb.sheetnames:
+      ws_match = wb["Mapping Key Matching"]
       ws_match.delete_rows(1, ws_match.max_row)
     else:
       ws_match = wb.active
-      ws_match.title = "Loadsheet Matching"
+      ws_match.title = "Mapping Key Matching"
 
     match_headers = [
-        "Loadsheet Row",
+        "Row",
         "Status",
         "Matched BMS Row Count",
         "Building",
         "proxyId",
-        "controlProgram",
-        "objectName",
-        "Loadsheet Path / unique_col2_value",
-        "Normalized Point Name",
+        "unique_col2_value",
         "standardFieldName",
-        "Matched BMS Column 2 Sample(s)",
     ]
     ws_match.append(match_headers)
     for cell in ws_match[1]:
@@ -656,19 +444,14 @@ def write_matching_and_cli_report(
     for m in mappings:
       is_matched = m.matched_bms_rows > 0
       status = "MATCHED" if is_matched else "UNMATCHED"
-      samples = ", ".join(sorted(m.matched_bms_col2_samples))
       ws_match.append([
           m.row_number,
           status,
           m.matched_bms_rows,
           m.building,
           m.proxy_id,
-          m.control_program,
-          m.object_name,
-          m.raw_path,
-          m.normalized_point,
+          m.unique_col2_value,
           m.standard_field_name,
-          samples,
       ])
       status_cell = ws_match.cell(row=ws_match.max_row, column=2)
       status_cell.fill = ok_fill if is_matched else fail_fill
@@ -742,7 +525,7 @@ def write_matching_and_cli_report(
 def discover_existing_cli_files(
     root_dir: Path,
 ) -> Tuple[List[str], Dict[str, str], Dict[str, Path]]:
-  """Discovers existing *_cli_command.txt files under <root>/proxy_ids when starting directly at Step 6."""
+  """Discovers existing *_cli_command.txt files under <root>/proxy_ids when starting directly at Step 5-6."""
   proxy_root = root_dir / "proxy_ids"
   if not proxy_root.is_dir():
     sys.exit(
@@ -997,31 +780,19 @@ def prompt_start_step() -> int:
     print("Please enter a valid number between 1 and 6.")
 
 
-def prompt_mapping_mode() -> int:
-  """Prompts the user to choose between Loadsheet mode (1) or BMS CSV Mapping Key mode (2)."""
-  print(
-      "\nSelect mapping input mode:\n"
-      "  1. Standard Loadsheet (.xlsx with controlProgram, objectName, path,"
-      " proxyId, standardFieldName)\n"
-      "  2. BMS CSV standardFieldName Mapping Key (.xlsx with"
-      " unique_col2_value, proxyId, standardFieldName)"
-  )
-  while True:
-    raw = input("Enter mode (1 or 2) [default: 1]: ").strip()
-    if not raw or raw == "1":
-      return MODE_LOADSHEET
-    if raw == "2":
-      return MODE_MAPPING_KEY
-    print("Please enter 1 or 2.")
-
-
 def main() -> None:
   start_step = prompt_start_step()
-
-  root_dir = Path.cwd().resolve()
+  root_input = input(
+      "Enter output root directory [default: ./root]: "
+  ).strip()
+  root_dir = (
+      Path(root_input).expanduser().resolve()
+      if root_input
+      else (Path.cwd() / "root").resolve()
+  )
   report_path = (root_dir / "backfill_report.xlsx").resolve()
 
-  mappings: Optional[List[LoadsheetRow]] = None
+  mappings: Optional[List[MappingRow]] = None
   device_num_ids: Dict[str, str] = {}
   unique_proxy_ids: List[str] = []
   building_by_proxy: Dict[str, str] = {}
@@ -1031,29 +802,18 @@ def main() -> None:
   cli_files: Dict[str, Path] = {}
 
   if start_step <= 5:
-    mapping_mode = prompt_mapping_mode()
-    if mapping_mode == MODE_LOADSHEET:
-      loadsheet_input = prompt_non_empty("Enter path to loadsheet (.xlsx): ")
-      loadsheet_path = Path(loadsheet_input).expanduser().resolve()
-      if not loadsheet_path.is_file():
-        sys.exit(f"Error: Loadsheet file not found at '{loadsheet_path}'.")
+    key_input = prompt_non_empty(
+        "Enter path to BMS CSV standardFieldName mapping key (.xlsx): "
+    )
+    key_path = Path(key_input).expanduser().resolve()
+    if not key_path.is_file():
+      sys.exit(f"Error: Mapping key file not found at '{key_path}'.")
+    building_name = prompt_non_empty(
+        "Enter building name (e.g., US-MTV-L441): "
+    )
 
-      print("\n[Step 1/6] Reading loadsheet...")
-      mappings = read_loadsheet(loadsheet_path)
-    else:
-      key_input = prompt_non_empty(
-          "Enter path to BMS CSV standardFieldName mapping key (.xlsx): "
-      )
-      key_path = Path(key_input).expanduser().resolve()
-      if not key_path.is_file():
-        sys.exit(f"Error: Mapping key file not found at '{key_path}'.")
-      building_name = prompt_non_empty(
-          "Enter building name (e.g., US-MTV-L441): "
-      )
-
-      print("\n[Step 1/6] Reading BMS CSV standardFieldName mapping key...")
-      mappings = read_mapping_key_xlsx(key_path, building_name)
-
+    print("\n[Step 1/6] Reading BMS CSV standardFieldName mapping key...")
+    mappings = read_mapping_key_xlsx(key_path, building_name)
     if not mappings:
       sys.exit(
           "No valid rows with a non-blank proxyId and standardFieldName found."
@@ -1082,11 +842,6 @@ def main() -> None:
             f"  proxyId '{proxy_id}' not found in mapping CSV. Enter"
             " device_num_id: "
         )
-      if not building_by_proxy.get(proxy_id):
-        building_by_proxy[proxy_id] = prompt_non_empty(
-            f"  Building not found for '{proxy_id}'. Enter building code"
-            " (e.g., US-MTV-L441): "
-        )
 
   if start_step <= 3:
     bms_input = prompt_non_empty("Enter path to BMS CSV export (.csv): ")
@@ -1099,12 +854,12 @@ def main() -> None:
     timeseries_by_proxy, matched_fields_by_proxy, broken_timestamps = (
         process_bms_csv(bms_csv_path, mappings)
     )
-    matched_loadsheet_count = sum(1 for m in mappings if m.matched_bms_rows > 0)
-    unmatched_loadsheet_count = len(mappings) - matched_loadsheet_count
+    matched_count = sum(1 for m in mappings if m.matched_bms_rows > 0)
+    unmatched_count = len(mappings) - matched_count
     broken_total = sum(broken_timestamps.values())
     print(
-        f"  Mapping rows matched: {matched_loadsheet_count:,} /"
-        f" {len(mappings):,} ({unmatched_loadsheet_count:,} unmatched)."
+        f"  Mapping rows matched: {matched_count:,} /"
+        f" {len(mappings):,} ({unmatched_count:,} unmatched)."
     )
     if broken_total:
       print(
@@ -1162,7 +917,7 @@ def main() -> None:
       print("  Matching report saved.")
     else:
       print(
-          f"\n[Step 5/6] Keeping existing Loadsheet Matching report at"
+          f"\n[Step 5/6] Keeping existing Mapping Key Matching report at"
           f" '{report_path}'."
       )
 
