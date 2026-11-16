@@ -1,2 +1,126 @@
 # backfill-tool
 Used for backfilling BMS trend data into the carson datalake timeseries table
+
+## Repository Files
+
+| File | Purpose |
+| :--- | :--- |
+| `bms_backfill_generator.py` | Main end-to-end automation script (Steps 1–6) |
+| `extract_unique_col2.py` | Helper debug script that streams a large BMS CSV and exports all unique Column 2 values to `.xlsx` |
+| `requirements.txt` | Python dependencies (`openpyxl>=3.1.0`; all other imports use the Python 3.9+ standard library) |
+
+## Setup
+
+### 1. Python Virtual Environment
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 2. Authentication (Required for Step 6)
+
+Before running Step 6 (backfill CLI execution), authenticate in the same terminal session:
+
+```bash
+gcert
+```
+
+## Input File Formats
+
+### 1. BMS CSV `standardFieldName` Mapping Key (`.xlsx`)
+
+An Excel workbook mapping unique Column 2 identifiers from the BMS CSV to `proxyId` and `standardFieldName`. Rows where `standardFieldName` or `proxyId` is blank are automatically skipped.
+
+| `unique_col2_value` | `proxyId` | `standardFieldName` |
+| :--- | :--- | :--- |
+| `#us-mtv-l441_ac-1_trane_economizer` | `DDC-2923807` | |
+| `#us-mtv-l441_ac-1_trane_economizer/damper_control_tn` | `DDC-2923807` | `outside_air_damper_percentage_command` |
+| `#us-mtv-l441_ac-1_trane_economizer/econ_minimum_position_setpoint_tn` | `DDC-2923807` | `economizer_mode` |
+
+> [!TIP]
+> Run `python3 extract_unique_col2.py` on your BMS CSV export to generate a starting `.xlsx` list of all `unique_col2_value` strings.
+
+### 2. `proxy_id <-> external_id` Mappings (`.csv`)
+
+A comma- or tab-delimited CSV mapping each `proxy_id` to its numeric `device_num_id`:
+
+```csv
+proxy_id,device_num_id
+DDC-2923805,149904163793602
+DDC-2923806,260417378852635
+DDC-2923807,155916064956739
+```
+
+This list can be generated using this SQL query:
+
+```
+SELECT DISTINCT
+  device_id AS proxy_id,
+  device_num_id
+FROM carson_users.onboarding_device_mapping
+WHERE device_registry_id = 'US-MTV-L441'
+```
+
+If any `proxyId` from the mapping key is missing from this CSV, the script will prompt you for its `device_num_id`.
+
+### 3. BMS CSV Export (`.csv`)
+
+A **headerless** CSV (or tab-delimited file) starting immediately with data rows, where:
+- **Column 2**: Point identifier matched directly against `unique_col2_value`
+- **Column 4**: ISO-8601 timestamp (e.g., `2023-09-12T13:50:00-07:00` or `2023-09-12T20:50:00Z`)
+- **Column 5**: Recorded point value
+
+This is a CSV file that is generated using the Trend Export feature of the BMS (example: https://webctrl-p-frigg-app.corp.goog/trendexport/?wbs=42206757#/managegroup/sources/editgroup/L441Roof)
+
+## Usage
+
+Run the main script from your activated virtual environment:
+
+```bash
+python3 bms_backfill_generator.py
+```
+
+### Workflow Steps (Resumable 1–6)
+
+At startup, you can choose any step (`1–6`) to start from and specify the output root directory (default: `./root`):
+
+1. **Read Mapping Key (`.xlsx`)**: Loads `unique_col2_value`, `proxyId`, and `standardFieldName`, and prompts once for the building code (e.g., `US-MTV-L441`).
+2. **Read `proxy_id <-> device_num_id` Mappings (`.csv`)**: Maps each `proxyId` to its `device_num_id`.
+3. **Match BMS Timeseries Data (`.csv`)**: Streams the BMS CSV with a progress bar, matches Column 2 values in $O(1)$ time, converts timestamps to Seattle time (`America/Los_Angeles` with automatic PST/PDT), and classifies irregular/broken timestamps.
+4. **Generate Per-`proxyId` CSVs & CLI Commands**:
+   - Applies **COV forward-filling** chronologically across all columns (leading nulls before a field's first non-empty value remain `""`).
+   - Uses irregular/fractional-second COV timestamps to update forward-fill state, then **omits** those irregular rows from the final CSV so only clean whole-second timestamps (`YYYY-MM-DD HH:MM:SS±HH:MM`) are emitted.
+   - Generates `<building>_<proxy_id>_cli_command.txt` using absolute `--data_file` paths.
+5. **Write Report (`backfill_report.xlsx`)**: Saves matching results and any broken/irregular timestamps.
+6. **Run Backfill CLI Commands**:
+   - Runs `cd "$(p4 g4d backfill)" && g4 sync && pwd` once.
+   - Skips any device whose generated CSV has 0 data rows.
+   - Streams `admin_session` / `blaze run` output live in a pseudo-terminal (`pty`).
+   - Saves full terminal output to `<building>_<proxy_id>_error_log.txt` if a command fails, and updates `backfill_report.xlsx`.
+
+> [!NOTE]
+> If Steps 1–5 have already completed, start at Step `6` and point to your existing output root directory to re-run the CLI commands without re-scanning the BMS CSV.
+
+## Output Structure
+
+```text
+<output_root>/
+├── backfill_report.xlsx
+└── proxy_ids/
+    ├── DDC-2923806/
+    │   ├── US-MTV-L441_DDC-2923806.csv
+    │   └── US-MTV-L441_DDC-2923806_cli_command.txt
+    └── DDC-2923810/
+        ├── US-MTV-L441_DDC-2923810.csv
+        ├── US-MTV-L441_DDC-2923810_cli_command.txt
+        └── US-MTV-L441_DDC-2923810_error_log.txt   # Created only if CLI execution fails
+```
+
+### `backfill_report.xlsx` Tabs
+
+1. **`Mapping Key Matching`**: Lists every row from the mapping key `.xlsx`, whether it `MATCHED` or was `UNMATCHED`, and the number of BMS rows matched.
+2. **`broken timestamps`**: Logs the original timestamp string, `proxyId`, `standardFieldName`, reason (e.g., COV/fractional seconds or invalid ISO-8601), and occurrence count for every row omitted from the output CSVs.
+3. **`CLI Execution Results`**: Records `SUCCEEDED` / `FAILED` / `SKIPPED (EMPTY CSV)` status, return code, CLI command file path, error log file path (if failed), and a summary of the terminal output.
