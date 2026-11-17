@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automates BMS CSV timeseries extraction (via Mapping Key), COV forward-filling, reporting, and backfill CLI execution."""
+"""Automates BMS CSV timeseries extraction (via Mapping Key), COV forward-filling, delete-mode command generation, reporting, and backfill CLI execution."""
 
 from collections import defaultdict
 import csv
@@ -33,14 +33,24 @@ VALID_TIMESTAMP_REGEX = re.compile(
     r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$"
 )
 
-STEPS_DESCRIPTION = """
-Workflow Steps:
+# Regex to extract generated Bigtable delete commands from BackfillTool delete-mode output
+BT_DELETE_REGEX = re.compile(r"(bt\s+delete\s+/bigtable/[^\r\n]+)")
+
+POPULATE_STEPS_DESCRIPTION = """
+Populate Mode Workflow Steps:
   1. Read BMS CSV standardFieldName mapping key (.xlsx)
   2. Read proxy_id <-> device_num_id mappings (.csv)
   3. Match BMS timeseries data (.csv) [heavy step]
   4. Generate per-proxyId CSVs (with COV forward-fill) and CLI command files
   5. Write Mapping Key Matching & broken timestamps report tabs (backfill_report.xlsx)
   6. Run backfill CLI commands (p4 g4d / g4 sync / blaze run) & record results
+"""
+
+DELETE_STEPS_DESCRIPTION = """
+Delete Mode Workflow Steps:
+  1. Read proxy_id <-> device_num_id mappings (.csv) & prompt for building + start/end timestamps
+  2. Generate per-proxyId delete CSVs and delete CLI command files
+  3. Run delete CLI commands (p4 g4d / g4 sync / blaze run), extract 'bt delete' commands & write summary/report
 """
 
 
@@ -124,6 +134,47 @@ def convert_and_classify_seattle_tz(
   if len(cache) < 250_000:
     cache[raw] = result
   return result
+
+
+def parse_and_format_delete_timestamp(raw_input: str) -> str:
+  """Parses a user-entered start/end timestamp and formats it in Seattle time ('YYYY-MM-DD HH:MM:SS±HH:MM').
+
+  If the user enters a naive timestamp (without a timezone offset), it is
+  interpreted as Seattle local time (America/Los_Angeles).
+  """
+  cleaned = raw_input.strip()
+  iso_input = f"{cleaned[:-1]}+00:00" if cleaned.endswith(("Z", "z")) else cleaned
+  dt = datetime.fromisoformat(iso_input)
+  if dt.tzinfo is None:
+    dt_local = dt.replace(tzinfo=SEATTLE_TZ)
+  else:
+    dt_local = dt.astimezone(SEATTLE_TZ)
+
+  formatted = dt_local.isoformat(sep=" ", timespec="seconds")
+  if not VALID_TIMESTAMP_REGEX.match(formatted):
+    raise ValueError(
+        f"Timestamp '{raw_input}' did not format to 'YYYY-MM-DD HH:MM:SS±HH:MM'"
+        f" (got '{formatted}')."
+    )
+  return formatted
+
+
+def prompt_delete_timestamp(prompt_text: str) -> str:
+  """Prompts the user for a delete-mode timestamp and normalizes/validates it."""
+  while True:
+    raw = input(prompt_text).strip()
+    if not raw:
+      print("Timestamp cannot be blank. Please try again.")
+      continue
+    try:
+      formatted = parse_and_format_delete_timestamp(raw)
+      print(f"  -> Normalized Seattle timestamp: {formatted}")
+      return formatted
+    except ValueError as exc:
+      print(
+          f"  Invalid timestamp ({exc}). Examples: '2025-03-01 00:00:00-08:00'"
+          " or '2025-03-01 00:00:00'."
+      )
 
 
 def read_mapping_key_xlsx(
@@ -323,12 +374,12 @@ def process_bms_csv(
   return timeseries_by_proxy, matched_fields_by_proxy, broken_timestamps
 
 
-def build_cli_command(
+def build_populate_cli_command(
     bug_number: str,
     data_file_abs: Path,
     device_num_id: str,
 ) -> str:
-  """Formats the backfill CLI command string for a proxy_id."""
+  """Formats the backfill populate CLI command string for a proxy_id."""
   normalized_bug = bug_number.strip()
   if normalized_bug and not normalized_bug.startswith("b/"):
     normalized_bug = f"b/{normalized_bug}"
@@ -347,7 +398,29 @@ def build_cli_command(
   )
 
 
-def write_proxy_outputs(
+def build_delete_cli_command(
+    bug_number: str,
+    data_file_abs: Path,
+    device_num_id: str,
+) -> str:
+  """Formats the backfill delete CLI command string for a proxy_id."""
+  normalized_bug = bug_number.strip()
+  if normalized_bug and not normalized_bug.startswith("b/"):
+    normalized_bug = f"b/{normalized_bug}"
+
+  return (
+      f'admin_session --reason="{normalized_bug}" -- \\\n'
+      "blaze run \\\n"
+      "java/com/google/corp/bizapps/rews/datalake/tools/backfill:backfill_tool"
+      " -- \\\n"
+      '--mode="delete" \\\n'
+      f'--data_file="{data_file_abs}" \\\n'
+      f"--device_num_id={device_num_id.strip()} \\\n"
+      "--environment=prod\n"
+  )
+
+
+def write_populate_proxy_outputs(
     root_dir: Path,
     building: str,
     proxy_id: str,
@@ -385,7 +458,7 @@ def write_proxy_outputs(
         ]
         writer.writerow(row)
 
-  cli_content = build_cli_command(
+  cli_content = build_populate_cli_command(
       bug_number=bug_number,
       data_file_abs=data_csv_path,
       device_num_id=device_num_id,
@@ -393,6 +466,75 @@ def write_proxy_outputs(
   cli_txt_path.write_text(cli_content, encoding="utf-8")
 
   return proxy_dir, cli_txt_path
+
+
+def write_delete_proxy_outputs(
+    root_dir: Path,
+    building: str,
+    proxy_id: str,
+    start_ts: str,
+    end_ts: str,
+    bug_number: str,
+    device_num_id: str,
+) -> Tuple[Path, Path]:
+  """Writes the 3-line delete <building>_<proxy_id>.csv and delete _cli_command.txt."""
+  proxy_dir = (root_dir / "proxy_ids" / proxy_id).resolve()
+  proxy_dir.mkdir(parents=True, exist_ok=True)
+
+  file_stem = f"{building}_{proxy_id}"
+  data_csv_path = (proxy_dir / f"{file_stem}.csv").resolve()
+  cli_txt_path = (proxy_dir / f"{file_stem}_cli_command.txt").resolve()
+
+  with data_csv_path.open("w", encoding="utf-8", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["Timestamp"])
+    writer.writerow([start_ts])
+    writer.writerow([end_ts])
+
+  cli_content = build_delete_cli_command(
+      bug_number=bug_number,
+      data_file_abs=data_csv_path,
+      device_num_id=device_num_id,
+  )
+  cli_txt_path.write_text(cli_content, encoding="utf-8")
+
+  return proxy_dir, cli_txt_path
+
+
+def extract_bt_delete_commands(output_text: str) -> List[str]:
+  """Extracts 'bt delete /bigtable/...' commands from BackfillTool delete output."""
+  matches = BT_DELETE_REGEX.findall(output_text)
+  cleaned: List[str] = []
+  for m in matches:
+    cmd = m.strip()
+    if cmd not in cleaned:
+      cleaned.append(cmd)
+  return cleaned
+
+
+def write_delete_summary_file(
+    root_dir: Path, cli_results: List[Dict[str, str]]
+) -> Path:
+  """Writes all extracted 'bt delete' commands to delete_commands_summary.txt for easy bug pasting."""
+  summary_path = (root_dir / "delete_commands_summary.txt").resolve()
+  lines: List[str] = [
+      "# Carson Backfill Delete Commands Summary",
+      f"# Generated: {datetime.now(SEATTLE_TZ).isoformat(sep=' ', timespec='seconds')}",
+      "",
+  ]
+  for res in cli_results:
+    proxy_id = res["proxy_id"]
+    dev_id = res["device_num_id"]
+    bt_cmds = res.get("bt_delete_commands", "").strip()
+    lines.append(f"## {proxy_id} (device_num_id: {dev_id}) - {res['status']}")
+    if bt_cmds:
+      lines.append(bt_cmds)
+    else:
+      lines.append("# No 'bt delete' commands found in output.")
+    lines.append("")
+
+  summary_path.write_text("\n".join(lines), encoding="utf-8")
+  return summary_path
 
 
 def write_matching_and_cli_report(
@@ -485,6 +627,9 @@ def write_matching_and_cli_report(
   if "CLI Execution Results" in wb.sheetnames:
     ws_cli = wb["CLI Execution Results"]
     ws_cli.delete_rows(1, ws_cli.max_row)
+  elif mappings is None and wb.active.title == "Sheet":
+    ws_cli = wb.active
+    ws_cli.title = "CLI Execution Results"
   else:
     ws_cli = wb.create_sheet(title="CLI Execution Results")
 
@@ -495,6 +640,7 @@ def write_matching_and_cli_report(
       "Return Code",
       "CLI Command File",
       "Error Log File",
+      "Generated bt delete Commands",
       "Command Output / Error Summary",
   ]
   ws_cli.append(cli_headers)
@@ -511,6 +657,7 @@ def write_matching_and_cli_report(
           res["return_code"],
           res["cli_file"],
           res.get("error_log_file", ""),
+          res.get("bt_delete_commands", ""),
           res["output"],
       ])
       status_cell = ws_cli.cell(row=ws_cli.max_row, column=3)
@@ -525,11 +672,12 @@ def write_matching_and_cli_report(
 def discover_existing_cli_files(
     root_dir: Path,
 ) -> Tuple[List[str], Dict[str, str], Dict[str, Path]]:
-  """Discovers existing *_cli_command.txt files under <root>/proxy_ids when starting directly at Step 5-6."""
+  """Discovers existing *_cli_command.txt files under <root>/proxy_ids."""
   proxy_root = root_dir / "proxy_ids"
   if not proxy_root.is_dir():
     sys.exit(
-        f"Error: Directory '{proxy_root}' not found. Run Steps 1-4 first."
+        f"Error: Directory '{proxy_root}' not found. Generate the CLI files"
+        " first."
     )
 
   unique_proxy_ids: List[str] = []
@@ -627,13 +775,14 @@ def execute_backfill_commands(
     unique_proxy_ids: List[str],
     device_num_ids: Dict[str, str],
     cli_files: Dict[str, Path],
+    step_label: str = "Step 6/6",
 ) -> List[Dict[str, str]]:
   """Runs `cd "$(p4 g4d backfill)" && g4 sync && pwd` once, then executes each proxyId's CLI command."""
   results: List[Dict[str, str]] = []
 
   print(
-      '\n[Step 6/6] Running initialization: cd "$(p4 g4d backfill)" && g4 sync'
-      " && pwd"
+      f'\n[{step_label}] Running initialization: cd "$(p4 g4d backfill)" && g4'
+      " sync && pwd"
   )
   init_proc = subprocess.run(
       'cd "$(p4 g4d backfill)" && g4 sync >&2 && pwd',
@@ -661,6 +810,7 @@ def execute_backfill_commands(
           "return_code": str(init_proc.returncode),
           "cli_file": str(cli_path),
           "error_log_file": str(log_path),
+          "bt_delete_commands": "",
           "output": err_msg,
       })
     return results
@@ -685,6 +835,7 @@ def execute_backfill_commands(
           "return_code": "1",
           "cli_file": str(cli_path),
           "error_log_file": str(log_path),
+          "bt_delete_commands": "",
           "output": err_msg,
       })
     return results
@@ -717,15 +868,18 @@ def execute_backfill_commands(
               "return_code": "N/A",
               "cli_file": str(cli_path),
               "error_log_file": "",
+              "bt_delete_commands": "",
               "output": msg,
           })
           continue
 
-    print(f"--- [{idx}/{total}] Running backfill for proxyId '{proxy_id}' ---")
+    print(f"--- [{idx}/{total}] Running command for proxyId '{proxy_id}' ---")
     print(f"Command:\n{cmd_text}\n", flush=True)
 
     returncode, output_text = run_interactive_pty_command(cmd_text, cwd=g4d_dir)
     print()
+
+    bt_cmds = "\n".join(extract_bt_delete_commands(output_text))
 
     if returncode == 0:
       status = "SUCCEEDED"
@@ -751,6 +905,7 @@ def execute_backfill_commands(
         "return_code": str(returncode),
         "cli_file": str(cli_path),
         "error_log_file": error_log_str,
+        "bt_delete_commands": bt_cmds,
         "output": trimmed_output,
     })
 
@@ -766,31 +921,133 @@ def prompt_non_empty(prompt_text: str) -> str:
     print("Input cannot be blank. Please try again.")
 
 
-def prompt_start_step() -> int:
-  """Prompts the user for which workflow step (1-6) to start from."""
-  print(STEPS_DESCRIPTION.strip())
+def prompt_operation_mode() -> str:
+  """Prompts the user to choose Populate mode or Delete mode."""
+  print(
+      "Select Backfill Tool operation mode:\n"
+      "  1. Populate Mode (--mode=\"populate\": extract BMS CSV timeseries &"
+      " backfill)\n"
+      "  2. Delete Mode   (--mode=\"delete\": generate & run delete commands"
+      " for a start/end window)"
+  )
+  while True:
+    raw = input("\nEnter mode (1 or 2) [default: 1]: ").strip()
+    if not raw or raw == "1":
+      return "populate"
+    if raw == "2":
+      return "delete"
+    print("Please enter 1 or 2.")
+
+
+def prompt_start_step(description: str, max_step: int) -> int:
+  """Prompts the user for which workflow step (1..max_step) to start from."""
+  print("\n" + description.strip())
   while True:
     raw = input(
-        "\nEnter step number to start from (1-6) [default: 1]: "
+        f"\nEnter step number to start from (1-{max_step}) [default: 1]: "
     ).strip()
     if not raw:
       return 1
-    if raw.isdigit() and 1 <= int(raw) <= 6:
+    if raw.isdigit() and 1 <= int(raw) <= max_step:
       return int(raw)
-    print("Please enter a valid number between 1 and 6.")
+    print(f"Please enter a valid number between 1 and {max_step}.")
 
 
-def main() -> None:
-  start_step = prompt_start_step()
-  root_input = input(
-      "Enter output root directory [default: ./root]: "
-  ).strip()
-  root_dir = (
-      Path(root_input).expanduser().resolve()
-      if root_input
-      else (Path.cwd() / "root").resolve()
+def run_delete_workflow(root_dir: Path, report_path: Path) -> None:
+  """Executes the Delete Mode workflow."""
+  start_step = prompt_start_step(DELETE_STEPS_DESCRIPTION, max_step=3)
+
+  unique_proxy_ids: List[str] = []
+  device_num_ids: Dict[str, str] = {}
+  cli_files: Dict[str, Path] = {}
+
+  if start_step <= 2:
+    mapping_input = prompt_non_empty(
+        "Enter path to proxy_id <-> external_id mappings CSV (.csv): "
+    )
+    mapping_csv_path = Path(mapping_input).expanduser().resolve()
+    if not mapping_csv_path.is_file():
+      sys.exit(f"Error: Mapping CSV file not found at '{mapping_csv_path}'.")
+
+    print("\n[Step 1/3] Reading proxy_id <-> external_id mappings CSV...")
+    device_num_ids = read_device_num_id_mappings(mapping_csv_path)
+    if not device_num_ids:
+      sys.exit("Error: No valid proxy_id -> device_num_id rows found in CSV.")
+    unique_proxy_ids = list(device_num_ids.keys())
+    print(f"  Loaded {len(unique_proxy_ids):,} proxyId(s).")
+
+    building_name = prompt_non_empty(
+        "Enter building name (e.g., US-MTV-L441): "
+    )
+    start_ts = prompt_delete_timestamp(
+        "Enter delete Start Timestamp (e.g., 2025-03-01 00:00:00-08:00): "
+    )
+    end_ts = prompt_delete_timestamp(
+        "Enter delete End Timestamp   (e.g., 2025-05-06 16:00:00-07:00): "
+    )
+    bug_number = prompt_non_empty("Enter bug number (e.g., b/580954604): ")
+
+    print("\n[Step 2/3] Generating per-proxyId delete CSVs and CLI files...")
+    total_proxies = len(unique_proxy_ids)
+    for idx, proxy_id in enumerate(unique_proxy_ids, start=1):
+      _, cli_txt_path = write_delete_proxy_outputs(
+          root_dir=root_dir,
+          building=building_name,
+          proxy_id=proxy_id,
+          start_ts=start_ts,
+          end_ts=end_ts,
+          bug_number=bug_number,
+          device_num_id=device_num_ids[proxy_id],
+      )
+      cli_files[proxy_id] = cli_txt_path
+      render_progress_bar(
+          idx,
+          total_proxies,
+          f"{idx}/{total_proxies} delete files written",
+          proxy_id,
+      )
+    print()
+
+    proceed = input(
+        "\nMake sure 'gcert' is active. Press Enter to run the delete CLI"
+        " commands (or type 'skip' to exit): "
+    ).strip()
+    if proceed.lower() == "skip":
+      print(f"\nSkipped CLI execution. Files written under: {root_dir / 'proxy_ids'}")
+      return
+  else:
+    unique_proxy_ids, device_num_ids, cli_files = discover_existing_cli_files(
+        root_dir
+    )
+
+  cli_results = execute_backfill_commands(
+      unique_proxy_ids=unique_proxy_ids,
+      device_num_ids=device_num_ids,
+      cli_files=cli_files,
+      step_label="Step 3/3",
   )
-  report_path = (root_dir / "backfill_report.xlsx").resolve()
+
+  summary_path = write_delete_summary_file(root_dir, cli_results)
+  write_matching_and_cli_report(
+      report_path,
+      mappings=None,
+      broken_timestamps=None,
+      cli_results=cli_results,
+  )
+
+  succeeded = sum(1 for r in cli_results if r["status"] == "SUCCEEDED")
+  failed = sum(1 for r in cli_results if r["status"].startswith("FAILED"))
+  print(
+      f"\nDone! Delete CLI commands succeeded: {succeeded}, failed: {failed}.\n"
+      f"Extracted 'bt delete' commands summary (ready for Carson bug):\n"
+      f"  {summary_path}\n"
+      f"Excel report updated at:\n  {report_path}"
+  )
+
+
+def run_populate_workflow(root_dir: Path, report_path: Path) -> None:
+  """Executes the Populate Mode workflow (Steps 1-6)."""
+  start_step = prompt_start_step(POPULATE_STEPS_DESCRIPTION, max_step=6)
 
   mappings: Optional[List[MappingRow]] = None
   device_num_ids: Dict[str, str] = {}
@@ -886,7 +1143,7 @@ def main() -> None:
             )
         )
 
-      _, cli_txt_path = write_proxy_outputs(
+      _, cli_txt_path = write_populate_proxy_outputs(
           root_dir=root_dir,
           building=building_by_proxy[proxy_id],
           proxy_id=proxy_id,
@@ -939,6 +1196,7 @@ def main() -> None:
       unique_proxy_ids=unique_proxy_ids,
       device_num_ids=device_num_ids,
       cli_files=cli_files,
+      step_label="Step 6/6",
   )
 
   write_matching_and_cli_report(
@@ -954,6 +1212,25 @@ def main() -> None:
       f"\nDone! CLI commands succeeded: {succeeded}, failed: {failed}, skipped:"
       f" {skipped}.\nFull report saved to:\n  {report_path}"
   )
+
+
+def main() -> None:
+  mode = prompt_operation_mode()
+
+  root_input = input(
+      "Enter output root directory [default: ./root]: "
+  ).strip()
+  root_dir = (
+      Path(root_input).expanduser().resolve()
+      if root_input
+      else (Path.cwd() / "root").resolve()
+  )
+  report_path = (root_dir / "backfill_report.xlsx").resolve()
+
+  if mode == "delete":
+    run_delete_workflow(root_dir, report_path)
+  else:
+    run_populate_workflow(root_dir, report_path)
 
 
 if __name__ == "__main__":
